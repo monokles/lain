@@ -25,6 +25,24 @@ local setmetatable = setmetatable
 
 -- Battery infos
 -- lain.widgets.bat
+local function calcTime(energy_now, energy_full, rate_power, ac_status)
+    local rate_time = 0
+
+    if ac_status == 1 then
+        rate_time = (energy_full - energy_now) / rate_power
+    else -- Discharging
+        rate_time = energy_now / rate_power
+    end
+
+    if rate_time < 0.01 then -- check for magnitude discrepancies (#199)
+        rate_time_magnitude = math.abs(math.floor(math.log10(rate_time)))
+        rate_time = rate_time * 10^(rate_time_magnitude - 2)
+    end
+
+    local hours     = math.floor(rate_time)
+    local minutes   = math.floor((rate_time - hours) * 60)
+    return( string.format("%02d:%02d", hours, minutes))
+end
 
 local function worker(args)
     local bat       = {}
@@ -61,11 +79,7 @@ local function worker(args)
         watt      = "N/A"
     }
 
-    bat_now.n_status = {}
-    for i = 1, #batteries do
-        bat_now.n_status[i] = "N/A"
-    end
-
+    bat_now.n = {}
     function update()
         local sum_rate_current      = 0
         local sum_rate_voltage      = 0
@@ -75,6 +89,9 @@ local function worker(args)
         local sum_energy_full       = 0
         local sum_energy_percentage = 0
         local pspath                = "/sys/class/power_supply/"
+
+        bat_now.ac_status = tonumber(first_line(string.format("%s%s/online", pspath, ac))) or "N/A"
+        bat_now.status = "N/A"
 
         for i, battery in ipairs(batteries) do
             local bstr    = pspath .. battery
@@ -97,7 +114,31 @@ local function worker(args)
                 local energy_percentage = tonumber(first_line(bstr .. "/capacity")) or
                                           math.floor((energy_now / energy_full) * 100)
 
-                bat_now.n_status[i] = first_line(bstr .. "/status") or "N/A"
+                -- status of battery (Full, Charging, Discharging, Unknown)
+                local status            = first_line(bstr .. "/status") or "N/A"
+
+                local time = "00:00"
+                local watt = 0
+                if status ~= "Full" and (rate_power > 0 or rate_current > 0) then
+                    local rate_energy = (rate_power > 0 and rate_power) or rate_current
+
+                    time = calcTime(energy_now, energy_full, rate_energy, bat_now.ac_status)
+                    watt = tonumber(string.format("%.2f", rate_energy / 1e6))
+                end
+
+                bat_now.n[i] = {
+                    status = status,
+                    time = time,
+                    watt = watt,
+                    perc = energy_percentage
+                }
+
+                --set summarized status as (dis)charging if at least one battery is (dis)charging
+                if status == "Charging" or status == "Discharging" then
+                    bat_now.status = status
+                elseif bat_now.status == "N/A" then
+                    bat_now.status = status
+                end
 
                 sum_rate_current      = sum_rate_current + (rate_current or 0)
                 sum_rate_voltage      = sum_rate_voltage + (rate_voltage or 0)
@@ -109,30 +150,13 @@ local function worker(args)
             end
         end
 
-        bat_now.status = bat_now.n_status[1]
-        bat_now.ac_status = tonumber(first_line(string.format("%s%s/online", pspath, ac))) or "N/A"
-
         if bat_now.status ~= "N/A" then
             -- update {perc,time,watt} iff battery not full and rate > 0
             if bat_now.status ~= "Full" and (sum_rate_power > 0 or sum_rate_current > 0) then
-                local rate_time = 0
                 local div = (sum_rate_power > 0 and sum_rate_power) or sum_rate_current
 
-                if bat_now.status == "Charging" then
-                    rate_time = (sum_energy_full - sum_energy_now) / div
-                else -- Discharging
-                    rate_time = sum_energy_now / div
-                end
-
-                if rate_time < 0.01 then -- check for magnitude discrepancies (#199)
-                    rate_time_magnitude = math.abs(math.floor(math.log10(rate_time)))
-                    rate_time = rate_time * 10^(rate_time_magnitude - 2)
-                end
-
-                local hours     = math.floor(rate_time)
-                local minutes   = math.floor((rate_time - hours) * 60)
                 bat_now.perc    = math.floor((sum_energy_now / sum_energy_full) * 100)
-                bat_now.time    = string.format("%02d:%02d", hours, minutes)
+                bat_now.time    = calcTime(sum_energy_now, sum_energy_full, div, bat_now.ac_status)
                 bat_now.watt    = tonumber(string.format("%.2f", sum_rate_energy / 1e6))
             elseif bat_now.status == "Full" then
                 bat_now.perc    = 100
